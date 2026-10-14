@@ -100,7 +100,7 @@ jobs:
           path: |
             /home/runner/cemups4-build/sysroot
             /home/runner/cemups4-build/build/mesa
-          key: crema-base-${{ runner.os }}-${{ hashFiles('Crema/toolchain/**', 'Crema/scripts/build-deps.sh', 'Crema/scripts/install-overlay.sh', 'Crema/scripts/build-mesa.sh', 'Crema/scripts/ps4-env.sh', 'Crema/patches/mesa-ps4.patch', 'Crema/port/mesa/**', 'Crema/port/mesa-overlay/**') }}
+          key: crema-base-v2-${{ runner.os }}-${{ hashFiles('Crema/toolchain/**', 'Crema/scripts/build-deps.sh', 'Crema/scripts/install-overlay.sh', 'Crema/scripts/build-mesa.sh', 'Crema/scripts/ps4-env.sh', 'Crema/patches/mesa-ps4.patch', 'Crema/port/mesa/**', 'Crema/port/mesa-overlay/**') }}
 
       - name: Build sysroot (libc++ 21 and runtime)
         if: steps.base_cache.outputs.cache-hit != 'true'
@@ -158,8 +158,6 @@ jobs:
           for l in src/amd/vulkan/libvulkan_radeon.a src/compiler/nir/libnir.a src/c11/impl/libmesa_util_c11.a; do
             [ -f "$PSB/build/mesa/$l" ] || { echo "::error::missing $l"; exit 1; }
           done
-          # only the static libraries are linked later: drop the object files from the cache
-          find $PSB/build/mesa -type d -name '*.p' -prune -exec rm -rf {} +
 
       - name: Save Stage 1 cache
         if: steps.base_cache.outputs.cache-hit != 'true'
