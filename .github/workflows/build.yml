@@ -195,7 +195,10 @@ jobs:
         run: |
           cd $HOME/cemups4
           ccache -M 3G
+          # pthread_create is in the PS4's libkernel (always linked): tell FindThreads so instead of
+          # letting its try-compile checks (-pthread etc.) decide.
           bash scripts/configure-cemu.sh \
+            -DCMAKE_HAVE_LIBC_PTHREAD=1 \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build Cemu
@@ -218,6 +221,12 @@ jobs:
           cp -v $GITHUB_WORKSPACE/Crema/out/*.pkg $GITHUB_WORKSPACE/dist/
           ls -la $GITHUB_WORKSPACE/dist
 
+      - name: Show CMake error log on failure
+        if: failure()
+        run: |
+          E=$PSB/build/cemu/CMakeFiles/CMakeError.log
+          [ -f "$E" ] && tail -n 80 "$E" || echo "no CMakeError.log"
+
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -227,6 +236,9 @@ jobs:
             /home/runner/cemups4-build/logs
             /home/runner/cemups4-build/build/deps/*.log
             /home/runner/cemups4-build/build/mesa/meson-logs
+            /home/runner/cemups4-build/build/cemu/CMakeFiles/CMakeError.log
+            /home/runner/cemups4-build/build/cemu/CMakeFiles/CMakeConfigureLog.yaml
+            /home/runner/cemups4-build/build/cemu/CMakeFiles/CMakeOutput.log
 
       - name: Release
         uses: softprops/action-gh-release@v2
