@@ -1,204 +1,250 @@
-name: Build Crema PKG
-
-# Cross-builds Crema (Cemu for PS4) with the OpenOrbis/PacBrew toolchain + clang 21 and
-# produces IV0000-CREM00001_00-CREMA00000000000.pkg (also copied to out/Crema-vXX.XX.pkg).
-#
-#   - push a tag like v01.17  -> builds, and publishes a GitHub Release with the pkg
-#   - Actions tab -> Run workflow -> builds with the version you type (release optional)
+name: Build Crema PS4
 
 on:
   push:
-    tags: ['v[0-9][0-9].[0-9][0-9]']
+    tags:
+      - "v*.*"
   workflow_dispatch:
     inputs:
-      version:
-        description: 'PKG version, XX.YY (e.g. 01.17)'
+      crema_version:
+        description: "Crema version (e.g. 01.17)"
         required: true
-        default: '01.00'
-      release:
-        description: 'Also publish a GitHub Release'
-        type: boolean
-        default: false
+        default: "01.00"
 
-env:
-  # Every script in this repo defaults to $HOME/cemups4-build, so keep that exact location.
-  PSB: /home/runner/cemups4-build
-  PS4_BUILD_ROOT: /home/runner/cemups4-build
-  PS4_SYSROOT: /home/runner/cemups4-build/sysroot
-  OPENORBIS: /opt/pacbrew/ps4/openorbis
-  CLANG_VER: '21'
-  MESA_TAG: mesa-26.0.8
-  LIBDRM_TAG: libdrm-2.4.125
-  JOBS: '4'
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    permissions:
-      contents: write   # needed to create the Release
-
+    env:
+      OPENORBIS: /opt/pacbrew/ps4/openorbis
+      CREMA_VERSION: ${{ github.event.inputs.crema_version || '01.00' }}
+      # Crema's cmake files hardcode $HOME/cemups4-build (PS4_MESA_BUILD, PS4_SYSROOT),
+      # so unlike Resonance the build root must keep this name.
+      PSB: /home/runner/cemups4-build
+      PS4_BUILD_ROOT: /home/runner/cemups4-build
+      JOBS: "4"
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out Crema
+        uses: actions/checkout@v4
+        with:
+          path: Crema
 
-      - name: Resolve version
-        id: ver
+      - name: Make repo scripts executable
         run: |
-          if [ "${GITHUB_REF_TYPE}" = tag ]; then V="${GITHUB_REF_NAME#v}"; else V="${{ inputs.version }}"; fi
-          [[ "$V" =~ ^[0-9]{2}\.[0-9]{2}$ ]] || { echo "version must look like 01.17, got '$V'"; exit 1; }
-          echo "version=$V" >> "$GITHUB_OUTPUT"
+          cd $GITHUB_WORKSPACE/Crema
+          find toolchain scripts -type f -exec chmod +x {} + 2>/dev/null || true
 
-      - name: Free disk space
-        run: |
-          # (dotnet is kept: PkgTool.Core may need it)
-          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "CREMA_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
 
-      # ---------------------------------------------------------------- host tools
-      - name: Install host packages
+      - name: Check version format
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build cmake perl python3 python3-venv python3-pip \
-            pkg-config bison flex ccache glslang-tools libxml2 xz-utils curl git
+          [[ "$CREMA_VERSION" =~ ^[0-9]{2}\.[0-9]{2}$ ]] || { echo "::error::version must look like 01.17, got '$CREMA_VERSION'"; exit 1; }
 
-      - name: Install LLVM ${{ env.CLANG_VER }}
+      - name: Install build dependencies
         run: |
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh ${CLANG_VER}
-          sudo apt-get install -y clang-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}
-          for t in clang clang++ ld.lld llvm-ar llvm-ranlib llvm-objcopy llvm-strip; do
-            command -v $t-${CLANG_VER} >/dev/null || { echo "missing $t-${CLANG_VER}"; exit 1; }
+          sudo apt -yq update
+          sudo apt -yq install git build-essential cmake zip xz-utils perl \
+            pacman-package-manager makepkg libarchive-tools autoconf libtool \
+            nasm curl ninja-build glslang-tools python3-pip python3-venv \
+            python3-pil wget lsb-release software-properties-common gnupg \
+            bison flex pkg-config ccache
+
+      - name: Install Mesa Python tools
+        run: |
+          mkdir -p $PSB
+          python3 -m venv $PSB/mesa-venv
+          $PSB/mesa-venv/bin/pip install meson mako pyyaml packaging setuptools
+          echo "$PSB/mesa-venv/bin" >> $GITHUB_PATH
+          $PSB/mesa-venv/bin/meson --version
+
+      - name: Install clang 21 and LLVM tools
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt -yq install clang-21 lld-21 llvm-21
+          for t in llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip ld.lld; do
+            if [ -x /usr/bin/$t-21 ] && ! command -v $t >/dev/null; then
+              sudo ln -s /usr/bin/$t-21 /usr/local/bin/$t
+            fi
+          done
+          clang-21 --version
+          ninja --version
+
+      - name: Install ps4 toolchain (OpenOrbis from PacBrew)
+        run: |
+          sudo tee -a /etc/pacman.conf > /dev/null <<EOF
+          [pacbrew]
+          SigLevel = Optional TrustAll
+          Server = https://pacman.mydedibox.fr/pacbrew/packages/
+          EOF
+          sudo pacman -Syu
+          sudo pacman --noconfirm -S ps4-openorbis ps4-openorbis-portlibs
+
+      - name: Prepare build tree and space-free repo link
+        run: |
+          mkdir -p $PSB/src $PSB/build $PSB/out $PSB/logs $PSB/oelf
+          # the scripts expect to be run through ~/cemups4
+          ln -sfn $GITHUB_WORKSPACE/Crema $HOME/cemups4
+
+      # ---------- Stage 1: sysroot, third-party libs, Mesa/RADV (cached) ----------
+      - name: Restore sysroot and Mesa cache
+        id: base_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /home/runner/cemups4-build/sysroot
+            /home/runner/cemups4-build/build/mesa
+          key: crema-base-${{ runner.os }}-${{ hashFiles('Crema/toolchain/**', 'Crema/scripts/build-deps.sh', 'Crema/scripts/install-overlay.sh', 'Crema/scripts/build-mesa.sh', 'Crema/scripts/ps4-env.sh', 'Crema/patches/mesa-ps4.patch', 'Crema/port/mesa/**', 'Crema/port/mesa-overlay/**') }}
+
+      - name: Build sysroot (libc++ 21 and runtime)
+        if: steps.base_cache.outputs.cache-hit != 'true'
+        run: |
+          cd $HOME/cemups4
+          bash toolchain/build-libcxx.sh
+          bash toolchain/build-runtime.sh
+
+      - name: Install FreeBSD-layout libc overlay
+        if: steps.base_cache.outputs.cache-hit != 'true'
+        run: |
+          cd $HOME/cemups4
+          bash scripts/install-overlay.sh
+          test -f $PSB/sysroot/libc-overlay/netinet/in.h
+
+      # Crema needs the full list (zlib libpng zstd libzip pugixml fmt glm rapidjson glslang
+      # boost openssl curl), so no arguments.
+      - name: Build third-party libs
+        if: steps.base_cache.outputs.cache-hit != 'true'
+        run: |
+          cd $HOME/cemups4
+          bash scripts/build-deps.sh
+          for f in libz libpng libzstd libzip libpugixml libfmt libcrypto libssl libcurl; do
+            [ -f $PSB/sysroot/lib/$f.a ] || { echo "::error::missing $f.a"; exit 1; }
           done
 
-      # !! VERIFY this step against how you installed PacBrew in WSL (package names / .deb name).
-      - name: Install PacBrew OpenOrbis toolchain
-        run: |
-          wget -q https://github.com/PacBrew/pacbrew-pacman/releases/latest/download/pacbrew-pacman-1.0.0.deb
-          sudo dpkg -i pacbrew-pacman-1.0.0.deb
-          sudo pacbrew-pacman -Sy --noconfirm ps4-openorbis ps4-openorbis-portlibs
-          test -f "$OPENORBIS/ps4vars.sh"
-          ls "$OPENORBIS/bin" "$OPENORBIS/bin/linux"
-
-      # ---------------------------------------------------------------- sysroot + deps
-      # libc++ 21, libc overlay, runtime lib, zlib/libpng/zstd/boost/openssl/curl/... (static)
-      - name: Restore sysroot cache
-        id: sysroot-cache
-        uses: actions/cache/restore@v4
+      # Only needed if Crema's Mesa patch doesn't apply to vanilla Mesa (see next step).
+      - name: Check out DolphinPS4 (Mesa patch fallback)
+        if: steps.base_cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
         with:
-          path: |
-            ~/cemups4-build/sysroot
-            ~/cemups4-build/build/deps
-          key: sysroot-${{ hashFiles('toolchain/**', 'scripts/build-deps.sh', 'scripts/install-overlay.sh') }}
+          repository: Glec6/DolphinPS4
+          path: DolphinPS4
 
-      - name: Build sysroot and dependencies
-        if: steps.sysroot-cache.outputs.cache-hit != 'true'
+      - name: Build Mesa/RADV static libraries
+        if: steps.base_cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "$PSB"/{src,build,out,logs}
-          ln -sfn "$GITHUB_WORKSPACE" "$HOME/cemups4"
-          bash toolchain/build-libcxx.sh        # also runs prepare-sysroot.sh
-          bash scripts/install-overlay.sh       # must come AFTER prepare-sysroot.sh
-          bash toolchain/build-runtime.sh
-          bash scripts/build-deps.sh
-          # keep only the .done stamps of the build dirs (sources/objects are huge)
-          find "$PSB/build/deps" -mindepth 1 -maxdepth 1 ! -name '*.done' -exec rm -rf {} +
-
-      - name: Save sysroot cache
-        if: steps.sysroot-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/cemups4-build/sysroot
-            ~/cemups4-build/build/deps
-          key: ${{ steps.sysroot-cache.outputs.cache-primary-key }}
-
-      # ---------------------------------------------------------------- Mesa RADV
-      - name: Restore Mesa cache
-        id: mesa-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/cemups4-build/build/mesa
-          key: mesa-${{ env.MESA_TAG }}-${{ hashFiles('patches/mesa-ps4.patch', 'port/mesa/**', 'port/mesa-overlay/**', 'scripts/build-mesa.sh', 'scripts/ps4-env.sh', 'toolchain/**') }}
-
-      - name: Build Mesa (RADV on GNM)
-        if: steps.mesa-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$PSB"/{src,build,host-tools/bin}
-          # host tools build-mesa.sh expects
-          python3 -m venv "$PSB/mesa-venv"
-          "$PSB/mesa-venv/bin/pip" install --quiet meson mako pyyaml packaging
-          ln -sf "$(command -v glslangValidator)" "$PSB/host-tools/bin/glslangValidator"
-          # Mesa source + patch; libdrm is only used for its headers
-          git clone --depth 1 --branch "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git "$PSB/src/mesa"
-          git clone --depth 1 --branch "$LIBDRM_TAG" https://gitlab.freedesktop.org/mesa/drm.git "$PSB/src/libdrm"
-          git -C "$PSB/src/mesa" apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/mesa-ps4.patch"
+          git clone --branch libdrm-2.4.125 --depth 1 https://gitlab.freedesktop.org/mesa/drm.git $PSB/src/libdrm
+          git clone --branch mesa-26.0.8 --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git $PSB/src/mesa
+          MESA=$PSB/src/mesa
+          CREMA_PATCH=$GITHUB_WORKSPACE/Crema/patches/mesa-ps4.patch
+          DOLPHIN_PATCH=$GITHUB_WORKSPACE/DolphinPS4/patches/mesa-ps4.patch
+          # BASE.txt says "DolphinPS4 Mesa 26.0.8 + patches/mesa-ps4.patch": Crema's patch may be a
+          # full patch against vanilla Mesa, or sit on top of DolphinPS4's. Try vanilla first.
+          if git -C $MESA apply --check $CREMA_PATCH 2>/dev/null; then
+            echo "Crema's Mesa patch applies to vanilla mesa-26.0.8"
+            git -C $MESA apply $CREMA_PATCH
+          else
+            echo "Crema's patch needs DolphinPS4's first"
+            git -C $MESA apply $DOLPHIN_PATCH
+            git -C $MESA apply $CREMA_PATCH
+          fi
+          cd $HOME/cemups4
           bash scripts/build-mesa.sh setup
-          # keep the static libraries, drop the object files
-          find "$PSB/build/mesa" -type d -name '*.p' -prune -exec rm -rf {} +
+          for l in src/amd/vulkan/libvulkan_radeon.a src/compiler/nir/libnir.a src/c11/impl/libmesa_util_c11.a; do
+            [ -f "$PSB/build/mesa/$l" ] || { echo "::error::missing $l"; exit 1; }
+          done
+          # only the static libraries are linked later: drop the object files from the cache
+          find $PSB/build/mesa -type d -name '*.p' -prune -exec rm -rf {} +
 
-      - name: Save Mesa cache
-        if: steps.mesa-cache.outputs.cache-hit != 'true'
+      - name: Save Stage 1 cache
+        if: steps.base_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ~/cemups4-build/build/mesa
-          key: ${{ steps.mesa-cache.outputs.cache-primary-key }}
+          path: |
+            /home/runner/cemups4-build/sysroot
+            /home/runner/cemups4-build/build/mesa
+          key: ${{ steps.base_cache.outputs.cache-primary-key }}
 
-      # ---------------------------------------------------------------- Cemu
-      - name: Fetch Cemu at the pinned commit and apply the PS4 patch
+      # ---------- Stage 2: Crema (Cemu) ----------
+      - name: Clone Cemu at the pinned base and apply the PS4 patch
         run: |
-          BASE="$(awk '/^base:/{print $2}' patches/BASE.txt)"
-          mkdir -p "$PSB/src" && cd "$PSB/src"
-          git init -q Cemu && cd Cemu
-          git remote add origin https://github.com/cemu-project/Cemu.git
-          git fetch --depth 1 origin "$BASE"
-          git checkout -q FETCH_HEAD
-          git submodule update --init --recursive --depth 1
-          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/cemu-ps4.patch"
+          cd $HOME/cemups4
+          BASE=$(awk '/^base:/{print $2}' patches/BASE.txt)
+          echo "Cemu base: $BASE"
+          git clone --filter=blob:none --no-checkout https://github.com/cemu-project/Cemu.git $PSB/src/Cemu
+          cd $PSB/src/Cemu
+          git checkout "$BASE"
+          git submodule update --init --recursive
+          git checkout -b ps4
+          git apply $HOME/cemups4/patches/cemu-ps4.patch
+          git log -1 --format='%h %ci %s'
 
       - name: ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-cemu-${{ github.run_id }}
-          restore-keys: ccache-cemu-
+          key: ccache-crema-${{ github.run_id }}
+          restore-keys: ccache-crema-
 
       - name: Configure Cemu
         run: |
+          cd $HOME/cemups4
           ccache -M 3G
           bash scripts/configure-cemu.sh \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build Cemu
-        run: JOBS=$(nproc) bash scripts/build-cemu.sh
-
-      # ---------------------------------------------------------------- package
-      - name: Package PKG
         run: |
-          mkdir -p "$RUNNER_TEMP/no-modules"   # public build: no Sony .sprx bundled
-          CEMU_PS4_VERSION="${{ steps.ver.outputs.version }}" \
-          DOLPHIN_PS4_MODULES_DIR="$RUNNER_TEMP/no-modules" \
+          cd $HOME/cemups4
+          bash scripts/build-cemu.sh
+
+      - name: Package
+        run: |
+          cd $HOME/cemups4
+          # no "upload" argument: that mode FTPs to a console.
+          # empty modules dir: public build, no Sony .sprx bundled.
+          mkdir -p $RUNNER_TEMP/no-modules
+          CEMU_PS4_VERSION=$CREMA_VERSION DOLPHIN_PS4_MODULES_DIR=$RUNNER_TEMP/no-modules \
             bash scripts/package-cemu.sh
-          ls -la out/
 
-      - name: Upload PKG
+      - name: Collect .pkg
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/dist
+          cp -v $GITHUB_WORKSPACE/Crema/out/*.pkg $GITHUB_WORKSPACE/dist/
+          ls -la $GITHUB_WORKSPACE/dist
+
+      - name: Upload build logs on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Crema-v${{ steps.ver.outputs.version }}-pkg
-          path: out/Crema-v${{ steps.ver.outputs.version }}.pkg
-          if-no-files-found: error
+          name: build-logs
+          path: |
+            /home/runner/cemups4-build/logs
+            /home/runner/cemups4-build/build/deps/*.log
+            /home/runner/cemups4-build/build/mesa/meson-logs
 
-      # crash logs must be symbolized against the exact binary (see scripts/crashlog.sh)
-      - name: Upload symbols
-        uses: actions/upload-artifact@v4
-        with:
-          name: Crema-v${{ steps.ver.outputs.version }}-symbols
-          path: ~/cemups4-build/oelf/v${{ steps.ver.outputs.version }}.*
-          retention-days: 90
-
-      - name: Publish Release
-        if: github.ref_type == 'tag' || inputs.release
+      - name: Release
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: v${{ steps.ver.outputs.version }}
-          name: Crema v${{ steps.ver.outputs.version }}
-          files: out/Crema-v${{ steps.ver.outputs.version }}.pkg
+          files: dist/*.pkg
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save PS4 PKG to Summary Page
+        uses: actions/upload-artifact@v4
+        with:
+          name: crema-ps4-pkg
+          path: dist/*.pkg
+
+      # crash logs must be symbolized against the exact binary (scripts/crashlog.sh)
+      - name: Save symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: crema-symbols-v${{ env.CREMA_VERSION }}
+          path: /home/runner/cemups4-build/oelf/*
+          retention-days: 30
