@@ -5372,7 +5372,7 @@ new file mode 100644
 index 0000000..d45f6c5
 --- /dev/null
 +++ b/src/gui/ps4/PS4PauseMenu.cpp
-@@ -0,0 +1,1059 @@
+@@ -0,0 +1,1061 @@
 +#include "gui/ps4/PS4PauseMenu.h"
 +
 +#include "gui/ps4/launcher/CremaSettings.h"
@@ -6030,6 +6030,8 @@ index 0000000..d45f6c5
 +		else
 +		{
 +			fs::remove(launch, ec);
++			// the launcher, not the autoload game again (PS4WindowSystem.cpp: PickGame)
++			std::ofstream(ActiveSettings::GetUserDataPath("skip-autoload"), std::ios::trunc) << "1\n";
 +		}
 +		ps4_boot_trace(sameGame ? "in-game menu: restarting the game" : "in-game menu: back to the launcher");
 +		sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
@@ -6462,7 +6464,7 @@ new file mode 100644
 index 0000000..c03daf3
 --- /dev/null
 +++ b/src/gui/ps4/PS4WindowSystem.cpp
-@@ -0,0 +1,871 @@
+@@ -0,0 +1,886 @@
 +// PS4 frontend: WindowSystem without a window system. Boots like the wx UI (CemuApp::OnInit +
 +// MainWindow::FileLoad) with fixed paths, renders full screen through VideoOut (PS4WSI.cpp) and
 +// keeps the main thread for the emulator's housekeeping.
@@ -6852,6 +6854,8 @@ index 0000000..c03daf3
 +			}
 +			std::error_code ec;
 +			fs::remove(kDataRoot / "launch.txt", ec);
++			// back to the launcher, not into the autoload game again (PickGame)
++			std::ofstream(kDataRoot / "skip-autoload", std::ios::trunc) << "1\n";
 +			sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
 +		}
 +	} sSystemImplementation;
@@ -6876,8 +6880,10 @@ index 0000000..c03daf3
 +{
 +
 +	// What to boot: launch.txt (written by the launcher or by hand) starts that game once; else
-+	// the default game (unless L1 is held); else the launcher, which writes launch.txt and
-+	// restarts the app (the menu and the emulator never share a process).
++	// the Autoload game (Settings -> Autoload; unless L1 is held, and only when the app was opened
++	// fresh: not after a game ended, was quit from its menu or stopped, or the launcher could never
++	// be reached again); else the launcher, which writes launch.txt and restarts the app (the menu
++	// and the emulator never share a process).
 +	fs::path PickGame()
 +	{
 +		const fs::path launchFile = kDataRoot / "launch.txt";
@@ -6894,15 +6900,26 @@ index 0000000..c03daf3
 +			if (!line.empty())
 +				return _utf8ToPath(line);
 +		}
-+		const std::string defaultGame = CremaLauncher::DefaultGame(_pathToUtf8(kDataRoot));
-+		if (!defaultGame.empty() && fs::exists(_utf8ToPath(defaultGame), ec))
++		// skip-autoload: written when a game ended or was quit (the app restarts into the launcher);
++		// last-stop.txt: a game stopped, and the launcher shows why
++		const fs::path skipFile = kDataRoot / "skip-autoload";
++		bool restarted = fs::exists(skipFile, ec);
++		fs::remove(skipFile, ec);
++		if (fs::exists(kDataRoot / "last-stop.txt", ec))
++			restarted = true;
++		const std::string autoloadGame = restarted ? std::string() : CremaLauncher::AutoloadGame(_pathToUtf8(kDataRoot));
++		if (!autoloadGame.empty() && fs::exists(_utf8ToPath(autoloadGame), ec))
 +		{
 +			if (!MenuButtonHeld())
 +			{
-+				Trace("default game: " + defaultGame);
-+				return _utf8ToPath(defaultGame);
++				Trace("autoload: " + autoloadGame);
++				return _utf8ToPath(autoloadGame);
 +			}
-+			Trace("default game skipped (L1 held): the launcher");
++			Trace("autoload skipped (L1 held): the launcher");
++		}
++		else if (restarted)
++		{
++			Trace("autoload skipped (the app restarted after a game): the launcher");
 +		}
 +		const std::string picked = CremaLauncher::Run(_pathToUtf8(kDataRoot), _pathToUtf8(kAppRoot), AppVersion());
 +		if (picked.empty())
@@ -8605,7 +8622,7 @@ new file mode 100644
 index 0000000..4e18b23
 --- /dev/null
 +++ b/src/gui/ps4/launcher/Launcher.cpp
-@@ -0,0 +1,3450 @@
+@@ -0,0 +1,3486 @@
 +// The Crema launcher, ported from DolphinPS4's PS4XMB (cover-flow Library and PSP-style XMB, side
 +// panels, themes, wallpapers, sounds, languages). Kept from it: the menus, the game library, the
 +// settings lists (CremaSettings, global or per game), themes and wallpapers, the game folder
@@ -9149,12 +9166,16 @@ index 0000000..4e18b23
 +		std::string lastGame;
 +		std::string style;           // "library" (covers) or "xmb"; empty: not chosen yet (asked)
 +		std::string sort = "title";  // "title", "recent" (last played first)
-+		std::string defaultGame;     // starts by itself when the app opens
++		std::string defaultGame;     // starts by itself when the app opens (autoload "default")
++		// Settings -> Autoload: what starts by itself when the app opens. "off", "last" (the game
++		// played last) or "default" (the one set with Triangle -> Set as Default Game).
++		std::string autoload = "off";
 +
 +		void Load(const std::string& path)
 +		{
 +			std::ifstream file(path);
 +			std::string line;
++			bool hasAutoload = false;
 +			while (std::getline(file, line))
 +			{
 +				while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
@@ -9183,7 +9204,15 @@ index 0000000..4e18b23
 +					sort = value;
 +				else if (key == "default_game")
 +					defaultGame = value;
++				else if (key == "autoload")
++				{
++					autoload = value == "last" ? "last" : value == "default" ? "default" : "off";
++					hasAutoload = true;
++				}
 +			}
++			// A file from before Autoload: a default game keeps starting by itself, as it did.
++			if (!hasAutoload)
++				autoload = defaultGame.empty() ? "off" : "default";
 +		}
 +		void Save(const std::string& path) const
 +		{
@@ -9192,7 +9221,7 @@ index 0000000..4e18b23
 +			file << "theme=" << theme << "\nwallpaper=" << wallpaper << "\nsounds=" << (sounds ? "on" : "off")
 +				 << "\nvolume=" << volume << "\nclock=" << (clock ? "on" : "off") << "\ngames_dir=" << gamesDir
 +				 << "\nlast_game=" << lastGame << "\nstyle=" << style << "\nsort=" << sort
-+				 << "\ndefault_game=" << defaultGame << "\n";
++				 << "\ndefault_game=" << defaultGame << "\nautoload=" << autoload << "\n";
 +		}
 +	};
 +
@@ -9363,6 +9392,7 @@ index 0000000..4e18b23
 +		SET_LANGUAGE,  // Language: a list of all of them
 +		SET_COVERS,    // Download Covers: GameTDB box art, with its progress
 +		SET_GAME_PACKS, // a game's Graphic Packs (settings rows: packs and presets)
++		SET_AUTOLOAD,   // Autoload: a game that starts by itself when Crema opens
 +		SET_GROUP = 100, // + index into CremaSettings::Categories(): a settings list
 +	};
 +
@@ -10095,6 +10125,10 @@ index 0000000..4e18b23
 +		settings.push_back({"Menu Style", Library() ? "Library" : "XMB", -1, -1, SET_STYLE});
 +		settings.push_back({"Clock", m_prefs.clock ? "On" : "Off", -1, -1, SET_CLOCK});
 +		settings.push_back({"Game Folder", GamesFolder(), -1, -1, SET_GAMES_DIR});
++		settings.push_back({"Autoload",
++			m_prefs.autoload == "last" ? "Last Played Game" :
++			m_prefs.autoload == "default" ? (m_prefs.defaultGame.empty() ? "Default Game (none set)" : "Default Game") : "Off",
++			-1, -1, SET_AUTOLOAD});
 +		settings.push_back({"Download Covers", "Box art from GameTDB for your games", -1, -1, SET_COVERS});
 +		settings.push_back({"Reset All Settings", "Every setting back to the defaults", -1, -1, SET_RESET_ALL});
 +		settings.push_back({"About", "", -1, -1, SET_ABOUT});
@@ -10184,6 +10218,15 @@ index 0000000..4e18b23
 +			m_panel.title = "Clock";
 +			m_panel.options = {"On", "Off"};
 +			m_panel.selected = m_prefs.clock ? 0 : 1;
++			break;
++		case SET_AUTOLOAD:
++			m_panel.title = "Autoload";
++			m_panel.options = {"Off", "Last Played Game", "Default Game"};
++			m_panel.selected = m_prefs.autoload == "last" ? 1 : m_prefs.autoload == "default" ? 2 : 0;
++			m_panel.lines = {"", "A game starts by itself", "when Crema opens.", "",
++				"Last Played Game: the game", "you played last.", "",
++				"Default Game: the one set with", "Triangle > Set as Default Game.", "",
++				"Hold L1 while Crema starts", "to open the menu instead."};
 +			break;
 +		case SET_GAMES_DIR:
 +			OpenFolderBrowser(GamesFolder());
@@ -10495,6 +10538,10 @@ index 0000000..4e18b23
 +				}
 +			}
 +			break;
++		case SET_AUTOLOAD:
++			m_prefs.autoload = option == 1 ? "last" : option == 2 ? "default" : "off";
++			Log("autoload: " + m_prefs.autoload);
++			break;
 +		case SET_STYLE:
 +			m_prefs.style = option == 0 ? "library" : "xmb";
 +			m_firstStyle = false;
@@ -10681,6 +10728,8 @@ index 0000000..4e18b23
 +					// Set / Remove as Default Game: one default game; the same game again removes it.
 +					const bool remove = m_prefs.defaultGame == game.path;
 +					m_prefs.defaultGame = remove ? "" : game.path;
++					if (!remove)
++						m_prefs.autoload = "default"; // choosing a default game turns it on
 +					m_prefs.Save(m_dataDir + "/launcher.ini");
 +					Log(remove ? "default game removed" : "default game: " + game.path);
 +					BuildItems();
@@ -12049,11 +12098,15 @@ index 0000000..4e18b23
 +	return menu.Run();
 +}
 +
-+std::string DefaultGame(const std::string& dataDir)
++std::string AutoloadGame(const std::string& dataDir)
 +{
 +	Preferences prefs;
 +	prefs.Load(dataDir + "/launcher.ini");
-+	return prefs.defaultGame;
++	if (prefs.autoload == "last")
++		return prefs.lastGame;
++	if (prefs.autoload == "default")
++		return prefs.defaultGame;
++	return {};
 +}
 +} // namespace CremaLauncher
 diff --git a/src/gui/ps4/launcher/Launcher.h b/src/gui/ps4/launcher/Launcher.h
@@ -12077,9 +12130,9 @@ index 0000000..75abc8b
 +// sounds, languages; launcher/: the intro and the logo).
 +std::string Run(const std::string& dataDir, const std::string& assetsDir, const std::string& version);
 +
-+// The game that starts by itself when the app opens (Triangle on a game -> Set as Default Game),
-+// or empty.
-+std::string DefaultGame(const std::string& dataDir);
++// The game that starts by itself when the app opens (Settings -> Autoload: the game played last,
++// or the one set with Triangle on a game -> Set as Default Game), or empty (Autoload off).
++std::string AutoloadGame(const std::string& dataDir);
 +} // namespace CremaLauncher
 diff --git a/src/gui/ps4/launcher/LauncherDisplay.cpp b/src/gui/ps4/launcher/LauncherDisplay.cpp
 new file mode 100644
