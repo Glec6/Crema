@@ -1,4 +1,4 @@
-name: Build Crema PS4
+name: Build Crema PS4 NEW
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
     env:
       OPENORBIS: /opt/pacbrew/ps4/openorbis
       CREMA_VERSION: ${{ github.event.inputs.crema_version || '01.00' }}
-      DATA_FOLDER: SuperSmashBrosWiiU   # /data/<this> on the console (the Crema default is "Crema")
+      DATA_FOLDER: SuperMarioMaker   # /data/<this> on the console (the Crema default is "Crema")
       # Crema's cmake files hardcode $HOME/cemups4-build (PS4_MESA_BUILD, PS4_SYSROOT),
       # so unlike Resonance the build root must keep this name.
       PSB: /home/runner/cemups4-build
