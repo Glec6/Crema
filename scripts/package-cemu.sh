@@ -27,7 +27,7 @@ echo "$VERSION" > "$STAGE/version.txt"
 # PkgTool's pkg_build crashes ("Sequence contains no elements") on empty folders.
 find "$STAGE" -type d -empty -delete
 # Vulkan (RADV on GNM) runs under the plain homebrew identity (4.5 GiB of direct memory).
-PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 "$HERE/make-pkg.sh" "$STAGE" SSBW00001 "Super Smash Bros. for WiiU" "$VERSION" SuperSmashWiiU "$PS4_BUILD_ROOT/out" | tail -1)"
+PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 "$HERE/make-pkg.sh" "$STAGE" SMMW00001 "Super Mario Maker" "$VERSION" SuperMarioMaker "$PS4_BUILD_ROOT/out" | tail -1)"
 ls -la "$PKG"
 # a copy next to the repo (E:\PS4 Projects\CEMUPS4\out), easy to find from Windows; *.pkg is ignored by git
 mkdir -p "$HERE/../out"
